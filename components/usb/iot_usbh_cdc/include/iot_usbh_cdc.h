@@ -217,8 +217,8 @@ esp_err_t usbh_cdc_port_open(const usbh_cdc_port_config_t *port_config, usbh_cdc
  *
  * @return
  *    - ESP_OK: Port closed successfully
- *    - ESP_ERR_INVALID_ARG: Invalid CDC port handle provided
- *    - ESP_ERR_INVALID_STATE: USB CDC driver is not installed or port is not open
+ *    - ESP_ERR_INVALID_ARG: CDC port handle is invalid or already being closed
+ *    - ESP_ERR_INVALID_STATE: USB CDC driver is not installed
  */
 esp_err_t usbh_cdc_port_close(usbh_cdc_port_handle_t cdc_port_handle);
 

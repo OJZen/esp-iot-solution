@@ -54,6 +54,7 @@ typedef struct {
 typedef struct usbh_cdc_dev_s {
     usb_device_handle_t dev_hdl;                  // USB device handle
     uint8_t dev_addr;                             // Device address
+    bool disconnected;
     struct {
         usb_transfer_t *xfer;
         SemaphoreHandle_t mux;
@@ -94,6 +95,8 @@ typedef struct usbh_cdc_port_s {
 static usbh_cdc_obj_t *p_usbh_cdc_obj = NULL;
 
 static void _cdc_transfers_free(usbh_cdc_port_t *cdc_port);
+static esp_err_t _cdc_port_close(usbh_cdc_port_t *cdc_port);
+static bool _cdc_close_disconnected_ports(void);
 static esp_err_t _cdc_dev_ctrl_allocate(usbh_cdc_dev_t *cdc_dev);
 static esp_err_t _cdc_dev_ctrl_free(usbh_cdc_dev_t *cdc_dev);
 static void _cdc_tx_xfer_submit(usb_transfer_t *out_xfer);
@@ -223,8 +226,11 @@ static void usbh_cdc_client_task(void *arg)
     usbh_cdc_obj_t *usbh_cdc_obj = p_usbh_cdc_obj; // Make local copy of the driver's handle
     assert(usbh_cdc_obj->cdc_client_hdl);
     // Start handling client's events
+    TickType_t timeout = portMAX_DELAY;
     while (1) {
-        usb_host_client_handle_events(usbh_cdc_obj->cdc_client_hdl, portMAX_DELAY);
+        usb_host_client_handle_events(usbh_cdc_obj->cdc_client_hdl, timeout);
+        // Drain completion callbacks before freeing ports; never wait here for another closer.
+        timeout = _cdc_close_disconnected_ports() ? pdMS_TO_TICKS(10) : portMAX_DELAY;
         EventBits_t events = xEventGroupGetBits(usbh_cdc_obj->event_group);
         if (events & CDC_TEARDOWN) {
             break;
@@ -269,6 +275,31 @@ static bool is_port_opened(usbh_cdc_port_t *cdc_port)
             return true;
         }
     }
+    return false;
+}
+
+static bool _cdc_close_disconnected_ports(void)
+{
+    if (xSemaphoreTake(p_usbh_cdc_obj->open_close_mutex, 0) != pdTRUE) {
+        return true;
+    }
+    while (true) {
+        usbh_cdc_port_t *port;
+        // Claim one port under the list lock; another closer may free the next one.
+        CDC_ENTER_CRITICAL();
+        SLIST_FOREACH(port, &p_usbh_cdc_obj->cdc_devices_port_list, list_entry) {
+            if (port->cdc_dev->disconnected && !port->to_close) {
+                port->to_close = true;
+                break;
+            }
+        }
+        CDC_EXIT_CRITICAL();
+        if (port == NULL) {
+            break;
+        }
+        ESP_ERROR_CHECK_WITHOUT_ABORT(_cdc_port_close(port));
+    }
+    xSemaphoreGive(p_usbh_cdc_obj->open_close_mutex);
     return false;
 }
 
@@ -329,14 +360,15 @@ static void usb_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg
             }
         }
 
-        usbh_cdc_port_t *current, *tmp;
-        SLIST_FOREACH_SAFE(current, &(p_usbh_cdc_obj->cdc_devices_port_list), list_entry, tmp) {
-            if (current->cdc_dev->dev_hdl != event_msg->dev_gone.dev_hdl) {
-                continue; // skip non-matching devices
+        // Cleanup runs after usb_host_client_handle_events() drains pending transfers.
+        CDC_ENTER_CRITICAL();
+        usbh_cdc_dev_t *device;
+        SLIST_FOREACH(device, &p_usbh_cdc_obj->cdc_devices_list, list_entry) {
+            if (device->dev_hdl == event_msg->dev_gone.dev_hdl) {
+                device->disconnected = true;
             }
-            // Close the port if the device is gone
-            ESP_ERROR_CHECK_WITHOUT_ABORT(usbh_cdc_port_close((usbh_cdc_port_handle_t)current));
         }
+        CDC_EXIT_CRITICAL();
         break;
     }
     default:
@@ -489,14 +521,19 @@ esp_err_t usbh_cdc_unregister_dev_event_cb(usbh_cdc_device_event_callback_t even
     return ESP_ERR_NOT_FOUND;
 }
 
-static esp_err_t _cdc_reset_transfer_endpoint(usb_device_handle_t dev_hdl, usb_transfer_t *transfer)
+static esp_err_t _cdc_stop_transfer_endpoint(usb_device_handle_t dev_hdl, usb_transfer_t *transfer)
 {
     assert(dev_hdl);
     assert(transfer);
     ESP_RETURN_ON_ERROR(usb_host_endpoint_halt(dev_hdl, transfer->bEndpointAddress), TAG, "usb_host_endpoint_halt failed");
     ESP_RETURN_ON_ERROR(usb_host_endpoint_flush(dev_hdl, transfer->bEndpointAddress), TAG, "usb_host_endpoint_flush failed");
-    usb_host_endpoint_clear(dev_hdl, transfer->bEndpointAddress);
     return ESP_OK;
+}
+
+static esp_err_t _cdc_reset_transfer_endpoint(usb_device_handle_t dev_hdl, usb_transfer_t *transfer)
+{
+    ESP_RETURN_ON_ERROR(_cdc_stop_transfer_endpoint(dev_hdl, transfer), TAG, "stop endpoint failed");
+    return usb_host_endpoint_clear(dev_hdl, transfer->bEndpointAddress);
 }
 
 static inline esp_err_t _cdc_host_transfer_submit(usbh_cdc_port_t *cdc_port, usb_transfer_t *xfer)
@@ -915,14 +952,27 @@ err_exit:
 
 esp_err_t usbh_cdc_port_close(usbh_cdc_port_handle_t cdc_port_handle)
 {
-    esp_err_t ret = ESP_OK;
     ESP_RETURN_ON_FALSE(p_usbh_cdc_obj != NULL, ESP_ERR_INVALID_STATE, TAG, "usb cdc is not installed");
-    // Check if the port is already opened
     usbh_cdc_port_t *cdc_port = (usbh_cdc_port_t *) cdc_port_handle;
-    ESP_RETURN_ON_FALSE(is_port_opened(cdc_port) == true, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is invalid");
 
-    cdc_port->to_close = true; // Mark port as to be closed
+    // The port must be claimed before waiting: DEV_GONE can close it concurrently.
+    CDC_ENTER_CRITICAL();
+    bool can_close = is_port_opened(cdc_port) && !cdc_port->to_close;
+    if (can_close) {
+        cdc_port->to_close = true;
+    }
+    CDC_EXIT_CRITICAL();
+    ESP_RETURN_ON_FALSE(can_close, ESP_ERR_INVALID_ARG, TAG, "cdc_port_handle is invalid or closing");
     xSemaphoreTake(p_usbh_cdc_obj->open_close_mutex, portMAX_DELAY);
+    esp_err_t ret = _cdc_port_close(cdc_port);
+    xSemaphoreGive(p_usbh_cdc_obj->open_close_mutex);
+    return ret;
+}
+
+// The caller owns open_close_mutex and has claimed the port under cdc_lock.
+static esp_err_t _cdc_port_close(usbh_cdc_port_t *cdc_port)
+{
+    esp_err_t ret = ESP_OK;
     usb_device_handle_t dev_hdl = cdc_port->cdc_dev->dev_hdl;
 
     CDC_ENTER_CRITICAL();
@@ -933,16 +983,16 @@ esp_err_t usbh_cdc_port_close(usbh_cdc_port_handle_t cdc_port_handle)
 
     xSemaphoreTake(cdc_port->data.out_mux, portMAX_DELAY); // wait for all the writers to finish
 
-    // Only try to reset endpoints and release interfaces if device is still connected
+    // Closing only needs halt/flush; clear would reactivate an endpoint after disconnect.
     if (dev_hdl != NULL) {
         if (cdc_port->data.in_xfer) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(_cdc_reset_transfer_endpoint(dev_hdl, cdc_port->data.in_xfer));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(_cdc_stop_transfer_endpoint(dev_hdl, cdc_port->data.in_xfer));
         }
         if (cdc_port->data.out_xfer) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(_cdc_reset_transfer_endpoint(dev_hdl, cdc_port->data.out_xfer));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(_cdc_stop_transfer_endpoint(dev_hdl, cdc_port->data.out_xfer));
         }
         if (cdc_port->notif.xfer) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(_cdc_reset_transfer_endpoint(dev_hdl, cdc_port->notif.xfer));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(_cdc_stop_transfer_endpoint(dev_hdl, cdc_port->notif.xfer));
         }
 
         vTaskDelay(pdMS_TO_TICKS(50)); // wait for any ongoing transfers to complete
@@ -992,7 +1042,6 @@ esp_err_t usbh_cdc_port_close(usbh_cdc_port_handle_t cdc_port_handle)
 
     free(cdc_port);
 
-    xSemaphoreGive(p_usbh_cdc_obj->open_close_mutex);
     return ret;
 }
 
